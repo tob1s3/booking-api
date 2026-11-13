@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Линтер и SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Ruff (стиль и типичные ошибки)
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Bandit (поиск уязвимостей в коде)
+        run: bandit -c pyproject.toml -r app
+      - name: pip-audit (известные уязвимости в зависимостях)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  test:
+    name: Тесты на PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: booking_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/booking_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Миграции применяются и совпадают с моделями
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+        run: |
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+      - name: Pytest
+        run: pytest -v
+
+  docker:
+    name: Сборка и сканирование образа
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Сборка образа
+        run: docker build -t booking-api:${{ github.sha }} .
+      - name: Trivy (уязвимости в образе)
+        # Для боевых проектов action лучше закреплять по SHA коммита, а не по тегу
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: booking-api:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
